@@ -1,28 +1,28 @@
 [build-system]
-requires = ["setuptools>=77.0.3"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "lstd"
 version = "0.1.0"
-description = "Binance data download, feature engineering, LSTD core model, and offline/online replay training utilities."
+description = "Binance data download, feature engineering, LSTD core model, and online/offline replay training utilities."
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [
-  { name = "Samuel V" }
-]
 dependencies = [
-  "numpy>=1.24",
-  "pandas>=2.0",
-  "requests>=2.31",
-  "torch>=2.1",
-  "tqdm>=4.66",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "requests>=2.31",
+    "torch>=2.1",
+    "tqdm>=4.66",
 ]
 
 [tool.setuptools]
-include-package-data = true
+package-dir = {"" = "lstd"}
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["lstd"]
 include = ["binance_ts*", "lstd_core*", "lstd_train*"]
-exclude = ["data*", "outputs*", "checkpoints*", "lenv*"]
+
+[project.scripts]
+binance-ts-example = "binance_ts.run_example:main"
+lstd-train-example = "lstd_train.run_example:main"
