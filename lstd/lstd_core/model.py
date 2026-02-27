@@ -238,8 +238,14 @@ class LSTDNet(nn.Module):
         logvar_s_full = torch.cat([logvar_s_hist, logvar_s_future], dim=1)
         logvar_d_full = torch.cat([logvar_d_hist, logvar_d_future], dim=1)
 
-        smooth_loss = self._smooth_constraint(z_s_hist)
-        sparse_loss = self._sparse_dependency_constraint(z_d_full)
+        smooth_loss = self._smooth_constraint(z_s_hist) if self.cfg.L2_weight != 0 else x.new_tensor(0.0)
+
+        # The sparse dependency constraint needs autograd.
+        # Do not compute it when its weight is zero, or when gradients are globally disabled.
+        if self.cfg.L1_weight != 0.0 and torch.is_grad_enabled():
+            sparse_loss = self._sparse_dependency_constraint(z_d_full)
+        else:
+            sparse_loss = x.new_tensor(0.0)
 
         if is_training:
             zs_kl_loss = self._kl_from_prior(
@@ -266,7 +272,6 @@ class LSTDNet(nn.Module):
                 self.cfg.L2_weight * smooth_loss
                 + self.cfg.L1_weight * sparse_loss
             )
-
         y_flat = y.reshape(y.shape[0], -1)
 
         if return_latents:
