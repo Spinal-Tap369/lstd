@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from copy import deepcopy
 from pprint import pprint
 from typing import Optional
 
@@ -13,23 +12,27 @@ from .trainer import OfflineLSTDTrainer
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Offline pretrain + online replay evaluation for LSTD."
+        description="Paper-style LSTD: warm-up pretraining + online replay evaluation."
     )
 
     # Required-ish
     parser.add_argument("--root-path", type=str, default="data")
     parser.add_argument("--data-path", type=str, required=True)
 
+
     # Windowing / split
+
     parser.add_argument("--seq-len", type=int, default=96)
     parser.add_argument("--label-len", type=int, default=48)
     parser.add_argument("--pred-len", type=int, default=16)
 
-    parser.add_argument("--train-ratio", type=float, default=0.70)
-    parser.add_argument("--val-ratio", type=float, default=0.15)
-    parser.add_argument("--test-ratio", type=float, default=0.15)
+    # 20% train + 5% val = 25% warm-up, 75% online/test
+    parser.add_argument("--train-ratio", type=float, default=0.20)
+    parser.add_argument("--val-ratio", type=float, default=0.05)
+    parser.add_argument("--test-ratio", type=float, default=0.75)
 
-    parser.add_argument("--features", type=str, choices=["S", "M", "MS"], default="M")
+    # For BTC multivariate context with single target supervision
+    parser.add_argument("--features", type=str, choices=["S", "M", "MS"], default="MS")
     parser.add_argument("--target", type=str, default="close")
     parser.add_argument("--scale", action="store_true")
     parser.add_argument("--no-scale", action="store_true")
@@ -37,37 +40,50 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--freq", type=str, default="15min")
     parser.add_argument("--delay-fb", action="store_true")
 
-    # Model
-    parser.add_argument("--model-mode", type=str, choices=["feature", "time"], default="feature")
-    parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--hidden-layers", type=int, default=2)
-    parser.add_argument("--depth", type=int, default=10)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--ts-hidden-dims", type=int, default=64)
-    parser.add_argument("--ts-output-dims", type=int, default=320)
+
+    # Model 
+
+    parser.add_argument("--model-mode", type=str, choices=["feature"], default="feature")
+
+    # Table 3 architecture widths
+    parser.add_argument("--long-conv-hidden", type=int, default=640)
+    parser.add_argument("--short-mlp-hidden", type=int, default=512)
+    parser.add_argument("--future-mlp-hidden", type=int, default=512)
+
+    # Prior networks r_i
     parser.add_argument("--lags", type=int, default=1)
-    parser.add_argument("--gamma", type=float, default=0.9)
-    parser.add_argument("--tau", type=float, default=0.5)
-    parser.add_argument("--use-adaptive-memory-conv", action="store_true")
-    parser.add_argument("--disable-adaptive-memory-conv", action="store_true")
+    parser.add_argument("--prior-hidden-dim", type=int, default=128)
+    parser.add_argument("--prior-num-hidden-layers", type=int, default=3)
+
+    # Loss weights
+    parser.add_argument("--zc-kl-weight", type=float, default=1.0)
+    parser.add_argument("--zd-kl-weight", type=float, default=1.0)
+
+    # Start conservative:
+    # L1 = sparse dependency constraint (expensive)
+    # L2 = long smoothness constraint
+    parser.add_argument("--l1-weight", type=float, default=0.0)
+    parser.add_argument("--l2-weight", type=float, default=1e-2)
+
 
     # Optimization
-    parser.add_argument("--train-epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--val-batch-size", type=int, default=64)
+    parser.add_argument("--train-epochs", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--val-batch-size", type=int, default=1)
     parser.add_argument("--test-batch-size", type=int, default=1)
+
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--pin-memory", action="store_true")
     parser.add_argument("--use-amp", action="store_true")
-    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--patience", type=int, default=1)
 
     # Runtime
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--experiment-name", type=str, default="btc_lstd_online_replay")
+    parser.add_argument("--experiment-name", type=str, default="btc_lstd_paper_faithful")
     parser.add_argument("--checkpoints-dir", type=str, default="checkpoints")
     parser.add_argument("--outputs-dir", type=str, default="outputs")
     parser.add_argument("--no-export-split-csvs", action="store_true")
@@ -116,24 +132,27 @@ def build_config_from_args(args: argparse.Namespace) -> OfflineTrainConfig:
     elif args.scale:
         cfg.windows.scale = True
 
+
     # Model
     cfg.model.mode = args.model_mode
-    cfg.model.hidden_dim = args.hidden_dim
-    cfg.model.hidden_layers = args.hidden_layers
-    cfg.model.depth = args.depth
-    cfg.model.dropout = args.dropout
-    cfg.model.ts_hidden_dims = args.ts_hidden_dims
-    cfg.model.ts_output_dims = args.ts_output_dims
+
+    # Table 3 architecture
+    cfg.model.long_conv_hidden = args.long_conv_hidden
+    cfg.model.short_mlp_hidden = args.short_mlp_hidden
+    cfg.model.future_mlp_hidden = args.future_mlp_hidden
+
+    # Prior nets
     cfg.model.lags = args.lags
-    cfg.model.gamma = args.gamma
-    cfg.model.tau = args.tau
+    cfg.model.prior_hidden_dim = args.prior_hidden_dim
+    cfg.model.prior_num_hidden_layers = args.prior_num_hidden_layers
 
-    if args.disable_adaptive_memory_conv:
-        cfg.model.use_adaptive_memory_conv = False
-    elif args.use_adaptive_memory_conv:
-        cfg.model.use_adaptive_memory_conv = True
+    # Loss weights
+    cfg.model.zc_kl_weight = args.zc_kl_weight
+    cfg.model.zd_kl_weight = args.zd_kl_weight
+    cfg.model.L1_weight = args.l1_weight
+    cfg.model.L2_weight = args.l2_weight
 
-    # Optim
+    # Optimization
     cfg.optim.train_epochs = args.train_epochs
     cfg.optim.batch_size = args.batch_size
     cfg.optim.val_batch_size = args.val_batch_size
@@ -166,6 +185,7 @@ def build_config_from_args(args: argparse.Namespace) -> OfflineTrainConfig:
     cfg.online.val_mode = args.val_online_mode
     cfg.online.val_n_inner = args.val_n_inner
 
+    # Early stopping
     cfg.patience = args.patience
 
     return cfg
@@ -182,7 +202,7 @@ def run_with_config(
 
     train_summary = None
     if not skip_train and not eval_only:
-        print("\n[1] Offline pretraining...")
+        print("\n[1] Offline pretraining / warm-up...")
         train_summary = trainer.fit()
         pprint(train_summary["history"])
 
