@@ -1,7 +1,6 @@
 # binance_ts/dataset.py
 
 import os
-from dataclasses import dataclass
 from typing import Optional, List
 
 import numpy as np
@@ -46,6 +45,7 @@ class BinanceLSTDDataset(Dataset):
     LSTD-style dataset built from the exported CSV:
       ['date', ...(features), target]
     """
+
     def __init__(
         self,
         root_path: str,
@@ -122,7 +122,7 @@ class BinanceLSTDDataset(Dataset):
         n = len(df_raw)
         n_train = int(n * self.train_ratio)
         n_val = int(n * self.val_ratio)
-        n_test = n - n_train - n_val
+        _n_test = n - n_train - n_val
 
         # Chronological borders with seq overlap like repo
         border1s = [0, n_train - self.seq_len, n_train + n_val - self.seq_len]
@@ -180,7 +180,7 @@ class BinanceLSTDDataset(Dataset):
         if self.inverse:
             seq_y = np.concatenate(
                 [self.data_x[r_begin:r_begin + self.label_len], self.data_y[r_begin + self.label_len:r_end]],
-                axis=0
+                axis=0,
             )
         else:
             seq_y = self.data_y[r_begin:r_end]
@@ -203,7 +203,11 @@ class BinanceLSTDPredDataset(Dataset):
     """
     Prediction dataset similar to repo Dataset_Pred:
     uses the last seq_len rows and generates future time marks.
+
+    This dataset is intentionally a single-sample dataset:
+    it exposes one final history window for inference.
     """
+
     def __init__(
         self,
         root_path: str,
@@ -275,19 +279,27 @@ class BinanceLSTDPredDataset(Dataset):
         self.data_stamp = data_stamp.astype(np.float32)
 
     def __getitem__(self, index: int):
-        s_begin = index
-        s_end = s_begin + self.seq_len
+        if index != 0:
+            raise IndexError("BinanceLSTDPredDataset contains exactly one sample at index 0.")
+
+        s_begin = 0
+        s_end = self.seq_len
         r_begin = s_end - self.label_len
         r_end = r_begin + self.label_len + self.pred_len
 
         seq_x = self.data_x[s_begin:s_end]
-        seq_y = self.data_x[r_begin:r_begin + self.label_len] if self.inverse else self.data_y[r_begin:r_begin + self.label_len]
+        seq_y = (
+            self.data_x[r_begin:r_begin + self.label_len]
+            if self.inverse
+            else self.data_y[r_begin:r_begin + self.label_len]
+        )
         seq_x_mark = self.data_stamp[s_begin:s_end]
         seq_y_mark = self.data_stamp[r_begin:r_end]
         return seq_x, seq_y, seq_x_mark, seq_y_mark
 
     def __len__(self):
-        return len(self.data_x) - self.seq_len - self.pred_len + 1
+        # This dataset is designed to expose one final prediction window.
+        return 1
 
     def inverse_transform(self, data: np.ndarray) -> np.ndarray:
         return self.scaler.inverse_transform(data)

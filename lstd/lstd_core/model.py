@@ -29,6 +29,17 @@ class LSTDNet(nn.Module):
         x_rec    : reconstructed history       [B, seq_len, enc_in]
         y_flat   : flattened future forecast   [B, pred_len * enc_in]
         other    : KL + smooth + sparse losses
+
+    IMPORTANT:
+    We decouple two ideas that were previously tied together:
+
+      1) sample_latents : whether z is sampled stochastically via reparameterization
+      2) include_kl     : whether KL prior terms are included in the objective
+
+    For backward compatibility, the old `is_training` argument is still supported.
+    If `is_training` is provided and `sample_latents/include_kl` are not, then:
+        sample_latents = is_training
+        include_kl     = is_training
     """
 
     def __init__(self, cfg: LSTDModelConfig, device: Optional[torch.device] = None):
@@ -105,13 +116,36 @@ class LSTDNet(nn.Module):
         if device is not None:
             self.to(device)
 
-    from typing import cast
-
     @property
     def stationary_dist(self) -> D.MultivariateNormal:
         mean = cast(torch.Tensor, self.stationary_dist_mean)
         cov = cast(torch.Tensor, self.stationary_dist_var)
         return D.MultivariateNormal(mean, cov)
+
+    def _resolve_forward_flags(
+        self,
+        sample_latents: Optional[bool],
+        include_kl: Optional[bool],
+        is_training: Optional[bool],
+    ) -> tuple[bool, bool]:
+        """
+        Backward-compatible flag resolution.
+
+        Priority:
+          explicit sample_latents/include_kl > legacy is_training > module.training
+        """
+        if is_training is not None:
+            if sample_latents is None:
+                sample_latents = is_training
+            if include_kl is None:
+                include_kl = is_training
+
+        if sample_latents is None:
+            sample_latents = bool(self.training)
+        if include_kl is None:
+            include_kl = bool(self.training)
+
+        return bool(sample_latents), bool(include_kl)
 
     def _kl_from_prior(
         self,
@@ -194,8 +228,20 @@ class LSTDNet(nn.Module):
         early_grads = grads[:, :-1, :]
         return early_grads.abs().mean()
 
-    def forward(self, x: torch.Tensor, is_training: bool = True, return_latents: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        sample_latents: Optional[bool] = None,
+        include_kl: Optional[bool] = None,
+        is_training: Optional[bool] = None,
+        return_latents: bool = False,
+    ):
         x = x.float()
+        sample_latents, include_kl = self._resolve_forward_flags(
+            sample_latents=sample_latents,
+            include_kl=include_kl,
+            is_training=is_training,
+        )
 
         # 1) Encode historical states
         h_s_hist = self.long_encoder(x)     # [B, L, C]
@@ -203,11 +249,11 @@ class LSTDNet(nn.Module):
 
         z_s_hist, mu_s_hist, logvar_s_hist = self.long_variational(
             h_s_hist,
-            is_training=is_training,
+            is_training=sample_latents,
         )
         z_d_hist, mu_d_hist, logvar_d_hist = self.short_variational(
             h_d_hist,
-            is_training=is_training,
+            is_training=sample_latents,
         )
 
         # 2) Predict future latent states
@@ -216,18 +262,17 @@ class LSTDNet(nn.Module):
 
         z_s_future, mu_s_future, logvar_s_future = self.long_future_variational(
             h_s_future,
-            is_training=is_training,
+            is_training=sample_latents,
         )
         z_d_future, mu_d_future, logvar_d_future = self.short_future_variational(
             h_d_future,
-            is_training=is_training,
+            is_training=sample_latents,
         )
 
         # 3) Decode history and forecast future
         x_rec = self.history_decoder(z_s_hist, z_d_hist)        # [B, L, C]
         y = self.future_predictor(z_s_future, z_d_future)       # [B, pred_len, C]
 
-         
         # 4) Auxiliary losses
         z_s_full = torch.cat([z_s_hist, z_s_future], dim=1)
         z_d_full = torch.cat([z_d_hist, z_d_future], dim=1)
@@ -247,7 +292,9 @@ class LSTDNet(nn.Module):
         else:
             sparse_loss = x.new_tensor(0.0)
 
-        if is_training:
+        zs_kl_loss = x.new_tensor(0.0)
+        zd_kl_loss = x.new_tensor(0.0)
+        if include_kl:
             zs_kl_loss = self._kl_from_prior(
                 mu_full=mu_s_full,
                 logvar_full=logvar_s_full,
@@ -261,17 +308,13 @@ class LSTDNet(nn.Module):
                 prior_net=self.short_prior,
             )
 
-            other_loss = (
-                self.cfg.zc_kl_weight * zs_kl_loss
-                + self.cfg.zd_kl_weight * zd_kl_loss
-                + self.cfg.L2_weight * smooth_loss
-                + self.cfg.L1_weight * sparse_loss
-            )
-        else:
-            other_loss = (
-                self.cfg.L2_weight * smooth_loss
-                + self.cfg.L1_weight * sparse_loss
-            )
+        other_loss = (
+            self.cfg.zc_kl_weight * zs_kl_loss
+            + self.cfg.zd_kl_weight * zd_kl_loss
+            + self.cfg.L2_weight * smooth_loss
+            + self.cfg.L1_weight * sparse_loss
+        )
+
         y_flat = y.reshape(y.shape[0], -1)
 
         if return_latents:
@@ -283,6 +326,10 @@ class LSTDNet(nn.Module):
                 "z_d_future": z_d_future,
                 "smooth_loss": smooth_loss.detach(),
                 "sparse_loss": sparse_loss.detach(),
+                "zs_kl_loss": zs_kl_loss.detach(),
+                "zd_kl_loss": zd_kl_loss.detach(),
+                "sample_latents": sample_latents,
+                "include_kl": include_kl,
             }
             return x_rec, y_flat, other_loss, extras
 

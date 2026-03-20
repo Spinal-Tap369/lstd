@@ -28,6 +28,7 @@ class OfflineLSTDTrainer:
     - run_offline()/test(): online replay evaluation on a stream
       (predict -> reveal label -> update), matching paper protocol.
     """
+
     def __init__(self, cfg: OfflineTrainConfig):
         self.cfg = deepcopy(cfg)
 
@@ -105,11 +106,17 @@ class OfflineLSTDTrainer:
         self,
         batch_x: torch.Tensor,
         batch_y: torch.Tensor,
-        is_training_forward: bool,
+        *,
+        sample_latents: bool,
+        include_kl: bool,
     ) -> Dict[str, torch.Tensor]:
         x = batch_x.to(self.device).float()
 
-        x_rec, outputs_flat, other_loss = self.model(x, is_training=is_training_forward)
+        x_rec, outputs_flat, other_loss = self.model(
+            x,
+            sample_latents=sample_latents,
+            include_kl=include_kl,
+        )
         pred_flat, true_flat = self._extract_pred_true(outputs_flat, batch_y)
 
         pred_loss = self.criterion(pred_flat, true_flat)
@@ -166,6 +173,11 @@ class OfflineLSTDTrainer:
 
         return None
 
+    def _freeze_encoders(self, model: LSTDNet) -> None:
+        for module in [model.long_encoder, model.short_encoder]:
+            for p in module.parameters():
+                p.requires_grad_(False)
+
     # -----------------------------
     # Offline training (pretraining)
     # -----------------------------
@@ -189,7 +201,12 @@ class OfflineLSTDTrainer:
 
             if self.use_amp:
                 with torch.cuda.amp.autocast():
-                    out = self._forward_losses(batch_x, batch_y, is_training_forward=True)
+                    out = self._forward_losses(
+                        batch_x,
+                        batch_y,
+                        sample_latents=True,
+                        include_kl=True,
+                    )
 
                 self.scaler.scale(out["total_loss"]).backward()
 
@@ -200,7 +217,12 @@ class OfflineLSTDTrainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                out = self._forward_losses(batch_x, batch_y, is_training_forward=True)
+                out = self._forward_losses(
+                    batch_x,
+                    batch_y,
+                    sample_latents=True,
+                    include_kl=True,
+                )
                 out["total_loss"].backward()
 
                 if self.cfg.optim.grad_clip_norm is not None:
@@ -208,7 +230,6 @@ class OfflineLSTDTrainer:
 
                 self.optimizer.step()
 
-            # Important for FSNet adaptive-memory behavior
             self.model.store_grad()
 
             total_loss_val = float(out["total_loss"].detach().cpu().item())
@@ -249,7 +270,12 @@ class OfflineLSTDTrainer:
             batch_x, batch_y, batch_x_mark, batch_y_mark = batch
             del batch_x_mark, batch_y_mark
 
-            out = self._forward_losses(batch_x, batch_y, is_training_forward=False)
+            out = self._forward_losses(
+                batch_x,
+                batch_y,
+                sample_latents=False,
+                include_kl=False,
+            )
 
             # Keep validation monitor clean: prediction loss only
             loss = float(out["pred_loss"].detach().cpu().item())
@@ -294,10 +320,9 @@ class OfflineLSTDTrainer:
             dynamic_ncols=True,
         )
 
-        # freeze encoder if regressor-only
+        # freeze encoders if regressor-only
         if val_mode == "regressor":
-            for p in model_clone.encoder.parameters():
-                p.requires_grad_(False)
+            self._freeze_encoders(model_clone)
 
         for batch in pbar:
             batch_x, batch_y, batch_x_mark, batch_y_mark = batch
@@ -306,7 +331,11 @@ class OfflineLSTDTrainer:
             # 1) Prediction BEFORE update (this is what should be scored)
             with torch.no_grad():
                 x = batch_x.to(self.device).float()
-                x_rec, outputs_flat, other_loss = model_clone(x, is_training=False)
+                x_rec, outputs_flat, other_loss = model_clone(
+                    x,
+                    sample_latents=False,
+                    include_kl=False,
+                )
 
                 pred_flat, true_flat = self._extract_pred_true(outputs_flat, batch_y)
                 pred_loss = self.criterion(pred_flat, true_flat)
@@ -318,7 +347,11 @@ class OfflineLSTDTrainer:
                     opt_clone.zero_grad(set_to_none=True)
 
                     x = batch_x.to(self.device).float()
-                    x_rec_u, outputs_flat_u, other_loss_u = model_clone(x, is_training=False)
+                    x_rec_u, outputs_flat_u, other_loss_u = model_clone(
+                        x,
+                        sample_latents=True,
+                        include_kl=True,
+                    )
                     pred_flat_u, true_flat_u = self._extract_pred_true(outputs_flat_u, batch_y)
 
                     loss_u = self.criterion(pred_flat_u, true_flat_u) + self.criterion(x_rec_u, x) + other_loss_u
@@ -452,10 +485,8 @@ class OfflineLSTDTrainer:
         for p in self.model.parameters():
             p.requires_grad_(True)
 
-        # Repo-style regressor mode freezes encoder only
         if mode == "regressor":
-            for p in self.model.encoder.parameters():
-                p.requires_grad_(False)
+            self._freeze_encoders(self.model)
 
     def _online_update_after_label(
         self,
@@ -466,13 +497,21 @@ class OfflineLSTDTrainer:
         """
         Model is expected to be in eval() mode (repo test-time behavior).
         We still compute grads and step optimizer for adaptation.
+
+        IMPORTANT:
+        Online adaptation is an optimization step, so we include KL terms here.
         """
         for _ in range(int(n_inner)):
             self.optimizer.zero_grad(set_to_none=True)
 
             if self.use_amp:
                 with torch.cuda.amp.autocast():
-                    out = self._forward_losses(batch_x, batch_y, is_training_forward=False)
+                    out = self._forward_losses(
+                        batch_x,
+                        batch_y,
+                        sample_latents=True,
+                        include_kl=True,
+                    )
 
                 self.scaler.scale(out["total_loss"]).backward()
 
@@ -483,7 +522,12 @@ class OfflineLSTDTrainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                out = self._forward_losses(batch_x, batch_y, is_training_forward=False)
+                out = self._forward_losses(
+                    batch_x,
+                    batch_y,
+                    sample_latents=True,
+                    include_kl=True,
+                )
                 out["total_loss"].backward()
 
                 if self.cfg.optim.grad_clip_norm is not None:
@@ -491,7 +535,6 @@ class OfflineLSTDTrainer:
 
                 self.optimizer.step()
 
-            # Important for FSNet adaptive-memory mechanism
             self.model.store_grad()
 
     def _resolve_split_loader(self, split: str):
@@ -564,7 +607,12 @@ class OfflineLSTDTrainer:
 
             # 1) Score the prediction BEFORE any online update
             with torch.no_grad():
-                out = self._forward_losses(batch_x, batch_y, is_training_forward=False)
+                out = self._forward_losses(
+                    batch_x,
+                    batch_y,
+                    sample_latents=False,
+                    include_kl=False,
+                )
 
                 pred_loss = float(out["pred_loss"].detach().cpu().item())
                 rec_loss = float(out["rec_loss"].detach().cpu().item())
@@ -708,7 +756,12 @@ class OfflineLSTDTrainer:
             batch_x, batch_y, batch_x_mark, batch_y_mark = batch
             del batch_x_mark, batch_y_mark
 
-            out = self._forward_losses(batch_x, batch_y, is_training_forward=False)
+            out = self._forward_losses(
+                batch_x,
+                batch_y,
+                sample_latents=False,
+                include_kl=False,
+            )
 
             pred_losses.append(float(out["pred_loss"].detach().cpu().item()))
             rec_losses.append(float(out["rec_loss"].detach().cpu().item()))
