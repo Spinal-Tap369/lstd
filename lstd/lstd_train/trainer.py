@@ -514,7 +514,7 @@ class OfflineLSTDTrainer:
                     out = self._forward_losses(
                         batch_x,
                         batch_y,
-                        sample_latents=False,
+                        sample_latents=True,
                         include_kl=True,
                     )
 
@@ -530,7 +530,7 @@ class OfflineLSTDTrainer:
                 out = self._forward_losses(
                     batch_x,
                     batch_y,
-                    sample_latents=False,
+                    sample_latents=True,
                     include_kl=True,
                 )
                 out["total_loss"].backward()
