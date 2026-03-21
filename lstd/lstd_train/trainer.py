@@ -349,7 +349,7 @@ class OfflineLSTDTrainer:
                     x = batch_x.to(self.device).float()
                     x_rec_u, outputs_flat_u, other_loss_u = model_clone(
                         x,
-                        sample_latents=True,
+                        sample_latents=False,
                         include_kl=True,
                     )
                     pred_flat_u, true_flat_u = self._extract_pred_true(outputs_flat_u, batch_y)
@@ -499,7 +499,12 @@ class OfflineLSTDTrainer:
         We still compute grads and step optimizer for adaptation.
 
         IMPORTANT:
-        Online adaptation is an optimization step, so we include KL terms here.
+        Online adaptation is deterministic here:
+          - sample_latents=False
+          - include_kl=True
+
+        So we adapt using the KL terms, but without injecting test-time
+        sampling noise into the update.
         """
         for _ in range(int(n_inner)):
             self.optimizer.zero_grad(set_to_none=True)
@@ -509,7 +514,7 @@ class OfflineLSTDTrainer:
                     out = self._forward_losses(
                         batch_x,
                         batch_y,
-                        sample_latents=True,
+                        sample_latents=False,
                         include_kl=True,
                     )
 
@@ -525,7 +530,7 @@ class OfflineLSTDTrainer:
                 out = self._forward_losses(
                     batch_x,
                     batch_y,
-                    sample_latents=True,
+                    sample_latents=False,
                     include_kl=True,
                 )
                 out["total_loss"].backward()
